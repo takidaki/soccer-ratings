@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from soccer_ratings.env import load_env_file
@@ -18,12 +19,14 @@ from soccer_ratings.client import (
     fetch_team_history,
 )
 from soccer_ratings.db import (
+    import_all_history,
     import_country_rankings,
+    import_country_history,
     import_league_history,
     import_league_ratings,
     init_db,
 )
-from soccer_ratings.dashboard import run_dashboard
+from soccer_ratings.dashboard import DashboardBindError, run_dashboard
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,6 +146,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Postgres connection URL. Defaults to DIRECT_DATABASE_URL, then DATABASE_URL.",
     )
 
+    import_country_history_parser = subparsers.add_parser(
+        "import-country-history",
+        help="Fetch and store deduped history for every league in a country.",
+    )
+    import_country_history_parser.add_argument(
+        "--country-url",
+        required=True,
+        help="Country path or URL, for example /England/.",
+    )
+    import_country_history_parser.add_argument(
+        "--database-url",
+        help="Optional Postgres connection URL. Defaults to DIRECT_DATABASE_URL, then DATABASE_URL.",
+    )
+
+    import_all_history_parser = subparsers.add_parser(
+        "import-all-history",
+        help="Fetch and store deduped history for every ranked country and league.",
+    )
+    import_all_history_parser.add_argument(
+        "--database-url",
+        help="Optional Postgres connection URL. Defaults to DIRECT_DATABASE_URL, then DATABASE_URL.",
+    )
+
     crawl_country_parser = subparsers.add_parser(
         "crawl-country",
         help="Fetch all league home/away ratings for a country.",
@@ -217,6 +243,10 @@ def main() -> int:
         payload = import_league_ratings(args.country_url, args.database_url)
     elif args.command == "import-league-history":
         payload = import_league_history(args.league_url, args.database_url)
+    elif args.command == "import-country-history":
+        payload = import_country_history(args.country_url, args.database_url)
+    elif args.command == "import-all-history":
+        payload = import_all_history(args.database_url)
     elif args.command == "crawl-country":
         payload = fetch_country_league_ratings(
             args.country_url,
@@ -227,7 +257,11 @@ def main() -> int:
             include_general=args.include_general,
         )
     elif args.command == "dashboard":
-        run_dashboard(host=args.host, port=args.port)
+        try:
+            run_dashboard(host=args.host, port=args.port)
+        except DashboardBindError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         return 0
     else:
         raise ValueError(f"Unsupported command: {args.command}")

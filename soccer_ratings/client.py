@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from urllib.parse import urljoin
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .odds import (
     apply_shin_margin,
     build_dnb_odds,
+    build_odds_from_probabilities,
     build_match_odds,
+    calibrate_probabilities_with_history,
     calculate_dnb_probabilities,
     calculate_match_probabilities,
+    summarize_historical_match_context,
 )
 from .parser import (
     parse_leagues,
@@ -26,7 +31,12 @@ BASE_URL = "https://www.soccer-rating.com"
 CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "league-history"
 
 
-def fetch_html(url: str = DEFAULT_URL, timeout: int = 30) -> str:
+def fetch_html(
+    url: str = DEFAULT_URL,
+    timeout: int = 30,
+    retries: int = 3,
+    retry_delay: float = 1.0,
+) -> str:
     request = Request(
         url,
         headers={
@@ -37,9 +47,26 @@ def fetch_html(url: str = DEFAULT_URL, timeout: int = 30) -> str:
             )
         },
     )
-    with urlopen(request, timeout=timeout) as response:
-        encoding = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(encoding, errors="replace")
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                encoding = response.headers.get_content_charset() or "utf-8"
+                return response.read().decode(encoding, errors="replace")
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in {429, 500, 502, 503, 504} or attempt >= retries:
+                raise
+        except URLError as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise
+
+        time.sleep(retry_delay * (attempt + 1))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to fetch HTML from {url}")
 
 
 def fetch_rankings(url: str = DEFAULT_URL) -> list[dict]:
@@ -88,6 +115,7 @@ def fetch_league_history(league_url: str) -> dict:
     teams = fetch_league_ratings(league_url, mode="general")
     collected_matches: list[dict] = []
     team_sources: list[dict] = []
+    failed_teams: list[dict] = []
 
     for team in teams:
         team_path = team.get("team_path")
@@ -95,7 +123,18 @@ def fetch_league_history(league_url: str) -> dict:
         if not team_path or not team_name:
             continue
 
-        team_history = fetch_team_history(team_path, focal_team=team_name)
+        try:
+            team_history = fetch_team_history(team_path, focal_team=team_name)
+        except Exception as exc:
+            failed_teams.append(
+                {
+                    "team": team_name,
+                    "team_path": team_path,
+                    "error": str(exc),
+                }
+            )
+            continue
+
         collected_matches.extend(team_history)
         team_sources.append(
             {
@@ -105,13 +144,15 @@ def fetch_league_history(league_url: str) -> dict:
             }
         )
 
-    deduped_matches = dedupe_matches(collected_matches)
+    league_matches = filter_matches_for_league(collected_matches, league_url)
+    deduped_matches = dedupe_matches(league_matches)
     return {
         "league_url": resolve_url(league_url),
         "team_count": len(team_sources),
-        "raw_match_count": len(collected_matches),
+        "raw_match_count": len(league_matches),
         "deduped_match_count": len(deduped_matches),
         "teams": team_sources,
+        "failed_teams": failed_teams,
         "matches": deduped_matches,
     }
 
@@ -235,16 +276,22 @@ def compare_teams_from_ratings(
     home_team: str,
     away_team: str,
     margin_percent: float = 0.0,
+    historical_matches: list[dict] | None = None,
 ) -> dict:
     home_entry = _find_team_rating(home_ratings, home_team)
     away_entry = _find_team_rating(away_ratings, away_team)
 
     home_rating = float(home_entry["rating"])
     away_rating = float(away_entry["rating"])
-    probabilities = calculate_match_probabilities(home_rating, away_rating)
+    base_probabilities = calculate_match_probabilities(home_rating, away_rating)
+    historical_context = summarize_historical_match_context(
+        historical_matches or [],
+        target_rating_gap=home_rating - away_rating,
+    )
+    probabilities = calibrate_probabilities_with_history(base_probabilities, historical_context)
     dnb_probabilities = calculate_dnb_probabilities(probabilities)
-    odds = build_match_odds(home_rating, away_rating)
-    dnb_odds = build_dnb_odds(home_rating, away_rating)
+    odds = build_odds_from_probabilities(probabilities)
+    dnb_odds = build_odds_from_probabilities(dnb_probabilities)
     market = apply_shin_margin(probabilities, margin_percent)
     dnb_market = apply_shin_margin(dnb_probabilities, margin_percent)
 
@@ -253,10 +300,14 @@ def compare_teams_from_ratings(
         "away_team": away_entry,
         "rating_gap": round(home_rating - away_rating, 2),
         "margin_percent": round(max(0.0, margin_percent), 2),
+        "model": "history-calibrated" if historical_context else "ratings-only",
+        "base_probabilities": base_probabilities,
+        "base_odds": build_match_odds(home_rating, away_rating),
         "probabilities": probabilities,
         "odds": odds,
         "dnb_probabilities": dnb_probabilities,
         "dnb_odds": dnb_odds,
+        "historical_context": historical_context,
         "market_probabilities": market["probabilities"],
         "market_odds": market["odds"],
         "market_dnb_probabilities": dnb_market["probabilities"],
@@ -309,6 +360,40 @@ def dedupe_matches(matches: list[dict]) -> list[dict]:
         ),
         reverse=True,
     )
+
+
+def filter_matches_for_league(matches: list[dict], league_url: str) -> list[dict]:
+    competition_code = league_code_from_url(league_url)
+    if not competition_code:
+        return matches
+
+    normalized_code = competition_code.upper()
+    return [
+        match
+        for match in matches
+        if str(match.get("competition", "")).strip().upper() == normalized_code
+    ]
+
+
+def league_code_from_url(league_url: str) -> str:
+    path = resolve_url(league_url).replace(BASE_URL, "").strip("/")
+    if not path:
+        return ""
+
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) >= 2:
+        return segments[1]
+
+    try:
+        mode_urls = discover_league_mode_urls(league_url)
+    except Exception:
+        return segments[-1]
+
+    home_path = mode_urls["home"].replace(BASE_URL, "").strip("/")
+    home_segments = [segment for segment in home_path.split("/") if segment]
+    if len(home_segments) >= 2:
+        return home_segments[1]
+    return segments[-1]
 
 
 def _find_team_rating(rows: list[dict], team_name: str) -> dict:

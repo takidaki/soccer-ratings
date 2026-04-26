@@ -34,13 +34,15 @@ def calculate_match_probabilities(home_rating: float, away_rating: float) -> dic
     }
 
 
+def build_odds_from_probabilities(probabilities: dict[str, float]) -> dict[str, float]:
+    return {
+        key: probability_to_decimal_odds(value) for key, value in probabilities.items()
+    }
+
+
 def build_match_odds(home_rating: float, away_rating: float) -> dict[str, float]:
     probabilities = calculate_match_probabilities(home_rating, away_rating)
-    return {
-        "home": probability_to_decimal_odds(probabilities["home"]),
-        "draw": probability_to_decimal_odds(probabilities["draw"]),
-        "away": probability_to_decimal_odds(probabilities["away"]),
-    }
+    return build_odds_from_probabilities(probabilities)
 
 
 def calculate_dnb_probabilities(probabilities: dict[str, float]) -> dict[str, float]:
@@ -58,9 +60,118 @@ def build_dnb_odds(home_rating: float, away_rating: float) -> dict[str, float]:
     dnb_probabilities = calculate_dnb_probabilities(
         calculate_match_probabilities(home_rating, away_rating)
     )
+    return build_odds_from_probabilities(dnb_probabilities)
+
+
+def summarize_historical_match_context(
+    historical_matches: list[dict],
+    target_rating_gap: float,
+    bandwidth: float = 120.0,
+) -> dict[str, float] | None:
+    completed_matches = [
+        match
+        for match in historical_matches
+        if match.get("home_goals") is not None
+        and match.get("away_goals") is not None
+        and match.get("home_rating") is not None
+        and match.get("away_rating") is not None
+    ]
+    if not completed_matches:
+        return None
+
+    weighted_draws = 0.0
+    weighted_home_non_draw = 0.0
+    weighted_non_draw = 0.0
+    weighted_home_goals = 0.0
+    weighted_away_goals = 0.0
+    weighted_total = 0.0
+    local_match_count = 0
+    overall_draws = 0
+
+    for match in completed_matches:
+        home_goals = int(match["home_goals"])
+        away_goals = int(match["away_goals"])
+        rating_gap = float(match["home_rating"]) - float(match["away_rating"])
+        weight = math.exp(-abs(rating_gap - target_rating_gap) / bandwidth)
+
+        if abs(rating_gap - target_rating_gap) <= bandwidth:
+            local_match_count += 1
+
+        if home_goals == away_goals:
+            weighted_draws += weight
+            overall_draws += 1
+        else:
+            weighted_non_draw += weight
+            if home_goals > away_goals:
+                weighted_home_non_draw += weight
+
+        weighted_home_goals += weight * home_goals
+        weighted_away_goals += weight * away_goals
+        weighted_total += weight
+
+    if weighted_total <= 0:
+        return None
+
+    effective_sample_size = min(len(completed_matches), round(weighted_total, 2))
+    draw_rate = weighted_draws / weighted_total
+    home_share_non_draw = (
+        weighted_home_non_draw / weighted_non_draw if weighted_non_draw > 0 else 0.5
+    )
+
     return {
-        "home": probability_to_decimal_odds(dnb_probabilities["home"]),
-        "away": probability_to_decimal_odds(dnb_probabilities["away"]),
+        "sample_size": len(completed_matches),
+        "effective_sample_size": effective_sample_size,
+        "local_match_count": local_match_count,
+        "draw_rate": round(draw_rate, 4),
+        "league_draw_rate": round(overall_draws / len(completed_matches), 4),
+        "home_share_non_draw": round(home_share_non_draw, 4),
+        "expected_home_goals": round(weighted_home_goals / weighted_total, 3),
+        "expected_away_goals": round(weighted_away_goals / weighted_total, 3),
+        "expected_total_goals": round((weighted_home_goals + weighted_away_goals) / weighted_total, 3),
+    }
+
+
+def calibrate_probabilities_with_history(
+    probabilities: dict[str, float],
+    historical_context: dict[str, float] | None,
+) -> dict[str, float]:
+    if not historical_context:
+        return {key: round(value, 4) for key, value in probabilities.items()}
+
+    effective_sample_size = float(historical_context.get("effective_sample_size", 0.0))
+    if effective_sample_size <= 0:
+        return {key: round(value, 4) for key, value in probabilities.items()}
+
+    draw_weight = min(0.4, effective_sample_size / 24.0 * 0.4)
+    win_share_weight = min(0.28, effective_sample_size / 24.0 * 0.28)
+
+    draw_probability = _blend(
+        probabilities["draw"],
+        float(historical_context["draw_rate"]),
+        draw_weight,
+    )
+    non_draw_probability = max(0.0, 1.0 - draw_probability)
+
+    base_non_draw_probability = probabilities["home"] + probabilities["away"]
+    if base_non_draw_probability <= 0:
+        base_home_share = 0.5
+    else:
+        base_home_share = probabilities["home"] / base_non_draw_probability
+
+    calibrated_home_share = _blend(
+        base_home_share,
+        float(historical_context["home_share_non_draw"]),
+        win_share_weight,
+    )
+    calibrated_home_share = min(0.95, max(0.05, calibrated_home_share))
+
+    home_probability = non_draw_probability * calibrated_home_share
+    away_probability = non_draw_probability - home_probability
+
+    return {
+        "home": round(home_probability, 4),
+        "draw": round(draw_probability, 4),
+        "away": round(max(0.0, away_probability), 4),
     }
 
 
@@ -84,6 +195,11 @@ def apply_shin_margin(probabilities: dict[str, float], margin_percent: float) ->
         "z": round(z, 6),
         "overround": round(sum(adjusted_probabilities.values()), 6),
     }
+
+
+def _blend(base_value: float, target_value: float, weight: float) -> float:
+    bounded_weight = min(1.0, max(0.0, weight))
+    return (base_value * (1.0 - bounded_weight)) + (target_value * bounded_weight)
 
 
 def _calculate_shin_book_probabilities(probabilities: dict[str, float], z: float) -> dict[str, float]:

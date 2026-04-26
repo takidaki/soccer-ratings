@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,8 +12,23 @@ from .client import (
     fetch_country_leagues,
     fetch_league_home_away_ratings,
     fetch_rankings,
+    filter_matches_for_league,
     load_cached_league_history,
 )
+from .db import load_league_history_matches
+from .db import (
+    load_country_leagues as load_country_leagues_from_db,
+)
+from .db import (
+    load_country_rankings as load_country_rankings_from_db,
+)
+from .db import (
+    load_league_home_away_ratings as load_league_home_away_ratings_from_db,
+)
+
+
+class DashboardBindError(RuntimeError):
+    """Raised when the dashboard cannot bind its requested address."""
 
 
 def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
@@ -35,7 +51,12 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/countries":
                 nonlocal countries_cache
                 if countries_cache is None:
-                    countries_cache = fetch_rankings()
+                    try:
+                        countries_cache = load_country_rankings_from_db()
+                    except Exception:
+                        countries_cache = None
+                    if not countries_cache:
+                        countries_cache = fetch_rankings()
                 self._send_json({"countries": countries_cache})
                 return
 
@@ -50,7 +71,12 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     return
 
                 if country_url not in leagues_cache:
-                    leagues_cache[country_url] = fetch_country_leagues(country_url)
+                    try:
+                        leagues_cache[country_url] = load_country_leagues_from_db(country_url)
+                    except Exception:
+                        leagues_cache[country_url] = []
+                    if not leagues_cache[country_url]:
+                        leagues_cache[country_url] = fetch_country_leagues(country_url)
                 self._send_json({"leagues": leagues_cache[country_url]})
                 return
 
@@ -65,7 +91,12 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     return
 
                 if league_url not in ratings_cache:
-                    ratings_cache[league_url] = fetch_league_home_away_ratings(league_url)
+                    try:
+                        ratings_cache[league_url] = load_league_home_away_ratings_from_db(league_url)
+                    except Exception:
+                        ratings_cache[league_url] = None
+                    if not ratings_cache[league_url]:
+                        ratings_cache[league_url] = fetch_league_home_away_ratings(league_url)
                 self._send_json(ratings_cache[league_url])
                 return
 
@@ -83,7 +114,31 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     return
 
                 if league_url not in ratings_cache:
-                    ratings_cache[league_url] = fetch_league_home_away_ratings(league_url)
+                    try:
+                        ratings_cache[league_url] = load_league_home_away_ratings_from_db(league_url)
+                    except Exception:
+                        ratings_cache[league_url] = None
+                    if not ratings_cache[league_url]:
+                        ratings_cache[league_url] = fetch_league_home_away_ratings(league_url)
+
+                historical_matches: list[dict] = []
+                history_source = "none"
+                try:
+                    historical_matches = load_league_history_matches(league_url)
+                    if historical_matches:
+                        history_source = "postgres"
+                except Exception:
+                    historical_matches = []
+
+                if not historical_matches:
+                    cached = load_cached_league_history(league_url)
+                    if cached is not None:
+                        historical_matches = filter_matches_for_league(
+                            cached.get("matches", []),
+                            league_url,
+                        )
+                        if historical_matches:
+                            history_source = "cache"
 
                 try:
                     comparison = compare_teams_from_ratings(
@@ -92,11 +147,13 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                         home_team=home_team,
                         away_team=away_team,
                         margin_percent=margin_percent,
+                        historical_matches=historical_matches,
                     )
                 except ValueError as exc:
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                     return
 
+                comparison["history_source"] = history_source
                 self._send_json(comparison)
                 return
 
@@ -176,7 +233,23 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
 
 
 def run_dashboard(host: str = "127.0.0.1", port: int = 8001) -> None:
-    server = ThreadingHTTPServer((host, port), create_dashboard_handler())
+    try:
+        server = ThreadingHTTPServer((host, port), create_dashboard_handler())
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            next_port = port + 1
+            raise DashboardBindError(
+                "\n".join(
+                    [
+                        f"Dashboard address http://{host}:{port} is already in use.",
+                        "Stop the existing process or choose another port:",
+                        f"  python3 app.py dashboard --port {next_port}",
+                        "To find the process on macOS:",
+                        f"  lsof -nP -iTCP:{port} -sTCP:LISTEN",
+                    ]
+                )
+            ) from exc
+        raise
     print(f"Dashboard running at http://{host}:{port}")
     try:
         server.serve_forever()
@@ -1535,7 +1608,11 @@ INDEX_HTML = """<!doctype html>
       awayWinOdds.textContent = `Odds ${Number(data.market_odds.away).toFixed(2)}`;
       homeDnbOdds.textContent = `Odds ${Number(data.market_dnb_odds.home).toFixed(2)}`;
       awayDnbOdds.textContent = `Odds ${Number(data.market_dnb_odds.away).toFixed(2)}`;
-      marketMeta.textContent = `Shin margin ${Number(data.margin_percent).toFixed(2)}% • 1X2 overround ${(Number(data.shin.overround) * 100).toFixed(2)}% • z ${Number(data.shin.z).toFixed(4)}`;
+      const historyContext = data.historical_context;
+      const historyMeta = historyContext
+        ? ` • ${data.history_source} history • ${historyContext.sample_size} completed matches • local sample ${historyContext.local_match_count} • exp goals ${Number(historyContext.expected_home_goals).toFixed(2)}-${Number(historyContext.expected_away_goals).toFixed(2)}`
+        : " • rating-only model";
+      marketMeta.textContent = `Shin margin ${Number(data.margin_percent).toFixed(2)}% • 1X2 overround ${(Number(data.shin.overround) * 100).toFixed(2)}% • z ${Number(data.shin.z).toFixed(4)}${historyMeta}`;
       homeTeamSelect.disabled = false;
       awayTeamSelect.disabled = false;
       state.loadingComparison = false;

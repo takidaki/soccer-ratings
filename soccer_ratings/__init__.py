@@ -14,7 +14,9 @@ from .client import (
     load_cached_league_history,
 )
 from .db import (
+    import_all_history,
     import_country_rankings,
+    import_country_history,
     import_league_history,
     import_league_ratings,
     init_db,
@@ -32,7 +34,9 @@ __all__ = [
     "fetch_league_ratings",
     "fetch_rankings",
     "fetch_team_history",
+    "import_all_history",
     "import_country_rankings",
+    "import_country_history",
     "import_league_history",
     "import_league_ratings",
     "init_db",

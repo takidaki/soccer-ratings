@@ -6,7 +6,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from .client import fetch_country_leagues, fetch_league_history, fetch_league_home_away_ratings, fetch_rankings
+from .client import (
+    fetch_country_leagues,
+    fetch_league_history,
+    fetch_league_home_away_ratings,
+    fetch_league_ratings,
+    fetch_rankings,
+    league_code_from_url,
+)
 from .env import load_env_file
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -73,6 +80,7 @@ def import_league_ratings(country_url: str, database_url: str | None = None) -> 
     leagues = fetch_country_leagues(country_url)
     with db_cursor(database_url, use_direct=True) as (conn, cur):
         imported = 0
+        team_snapshots_imported = 0
         fetched_at = datetime.utcnow()
         country_name = _country_name_from_path(country_url)
         country_id = _upsert_country(cur, country_name, country_url, None)
@@ -99,8 +107,44 @@ def import_league_ratings(country_url: str, database_url: str | None = None) -> 
                 ),
             )
             imported += 1
+
+            for mode in ("general", "home", "away"):
+                team_rows = fetch_league_ratings(row["league_path"], mode=mode)
+                for team_row in team_rows:
+                    team_id = _upsert_team(cur, team_row["team"], team_row.get("team_path"))
+                    cur.execute(
+                        """
+                        INSERT INTO rating_snapshots (
+                            scope,
+                            mode,
+                            country_id,
+                            league_id,
+                            team_id,
+                            ranking,
+                            rating,
+                            source_url,
+                            fetched_at
+                        )
+                        VALUES ('team', %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            mode,
+                            country_id,
+                            league_id,
+                            team_id,
+                            team_row["rank"],
+                            team_row["rating"],
+                            team_row.get("team_path"),
+                            fetched_at,
+                        ),
+                    )
+                    team_snapshots_imported += 1
         conn.commit()
-    return {"leagues_imported": imported, "country_url": country_url}
+    return {
+        "leagues_imported": imported,
+        "team_snapshots_imported": team_snapshots_imported,
+        "country_url": country_url,
+    }
 
 
 def import_league_history(league_url: str, database_url: str | None = None) -> dict:
@@ -196,7 +240,255 @@ def import_league_history(league_url: str, database_url: str | None = None) -> d
         "team_count": payload["team_count"],
         "matches_imported": imported_matches,
         "deduped_match_count": payload["deduped_match_count"],
+        "failed_team_count": len(payload.get("failed_teams", [])),
+        "failed_teams": payload.get("failed_teams", []),
     }
+
+
+def import_country_history(country_url: str, database_url: str | None = None) -> dict:
+    leagues = fetch_country_leagues(country_url)
+    results: list[dict] = []
+    total_matches_imported = 0
+    total_deduped_match_count = 0
+    failures: list[dict] = []
+
+    for league in leagues:
+        league_path = league.get("league_path")
+        if not league_path:
+            continue
+
+        try:
+            result = import_league_history(league_path, database_url)
+            results.append(result)
+            total_matches_imported += int(result.get("matches_imported", 0))
+            total_deduped_match_count += int(result.get("deduped_match_count", 0))
+        except Exception as exc:
+            failures.append(
+                {
+                    "league_url": league_path,
+                    "league": league.get("league"),
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "country_url": country_url,
+        "leagues_processed": len(results),
+        "matches_imported": total_matches_imported,
+        "deduped_match_count": total_deduped_match_count,
+        "failure_count": len(failures),
+        "failures": failures,
+        "leagues": results,
+    }
+
+
+def import_all_history(database_url: str | None = None) -> dict:
+    countries = fetch_rankings()
+    results: list[dict] = []
+    total_leagues_processed = 0
+    total_matches_imported = 0
+    total_deduped_match_count = 0
+    failures: list[dict] = []
+
+    for country in countries:
+        country_path = country.get("country_path")
+        if not country_path:
+            continue
+
+        try:
+            result = import_country_history(country_path, database_url)
+            results.append(result)
+            total_leagues_processed += int(result.get("leagues_processed", 0))
+            total_matches_imported += int(result.get("matches_imported", 0))
+            total_deduped_match_count += int(result.get("deduped_match_count", 0))
+        except Exception as exc:
+            failures.append(
+                {
+                    "country_url": country_path,
+                    "country": country.get("country"),
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "countries_processed": len(results),
+        "leagues_processed": total_leagues_processed,
+        "matches_imported": total_matches_imported,
+        "deduped_match_count": total_deduped_match_count,
+        "failure_count": len(failures),
+        "failures": failures,
+        "countries": results,
+    }
+
+
+def load_league_history_matches(
+    league_url: str,
+    database_url: str | None = None,
+    *,
+    completed_only: bool = True,
+) -> list[dict]:
+    competition = league_code_from_url(league_url).upper()
+    if not competition:
+        return []
+
+    with db_cursor(database_url, use_direct=False) as (_, cur):
+        cur.execute(
+            """
+            SELECT
+                m.match_date,
+                m.competition,
+                home_team.name AS home_team,
+                away_team.name AS away_team,
+                m.home_odds,
+                m.draw_odds,
+                m.away_odds,
+                m.home_rating,
+                m.away_rating,
+                m.home_goals,
+                m.away_goals,
+                m.result_text,
+                source_team.name AS focal_team,
+                m.source_team_path
+            FROM matches m
+            JOIN teams home_team ON home_team.id = m.home_team_id
+            JOIN teams away_team ON away_team.id = m.away_team_id
+            LEFT JOIN teams source_team ON source_team.id = m.source_team_id
+            WHERE m.competition = %s
+              AND (%s = FALSE OR (m.home_goals IS NOT NULL AND m.away_goals IS NOT NULL))
+            ORDER BY m.match_date DESC, m.id DESC
+            """,
+            (competition, completed_only),
+        )
+        rows = cur.fetchall()
+
+    matches = []
+    for row in rows:
+        matches.append(
+            {
+                "date": row[0].strftime("%d.%m.%y"),
+                "competition": row[1],
+                "home_team": row[2],
+                "away_team": row[3],
+                "home_odds": float(row[4]),
+                "draw_odds": float(row[5]),
+                "away_odds": float(row[6]),
+                "home_rating": float(row[7]),
+                "away_rating": float(row[8]),
+                "home_goals": row[9],
+                "away_goals": row[10],
+                "result": row[11],
+                "focal_team": row[12],
+                "source_team_path": row[13],
+            }
+        )
+    return matches
+
+
+def load_country_rankings(database_url: str | None = None) -> list[dict]:
+    with db_cursor(database_url, use_direct=False) as (_, cur):
+        cur.execute(
+            """
+            SELECT country_path, name, latest_rating
+            FROM countries
+            WHERE country_path IS NOT NULL
+            ORDER BY latest_rating DESC NULLS LAST, name ASC
+            """
+        )
+        rows = cur.fetchall()
+
+    results = []
+    for index, row in enumerate(rows, start=1):
+        results.append(
+            {
+                "rank": index,
+                "country_path": row[0],
+                "country": row[1],
+                "rating": float(row[2]) if row[2] is not None else None,
+            }
+        )
+    return results
+
+
+def load_country_leagues(country_url: str, database_url: str | None = None) -> list[dict]:
+    path = _path_from_url(country_url)
+    with db_cursor(database_url, use_direct=False) as (_, cur):
+        cur.execute(
+            """
+            SELECT l.league_path, l.name, l.latest_rating
+            FROM leagues l
+            JOIN countries c ON c.id = l.country_id
+            WHERE c.country_path = %s
+            ORDER BY l.latest_rating DESC NULLS LAST, l.name ASC
+            """,
+            (path,),
+        )
+        rows = cur.fetchall()
+
+    results = []
+    for index, row in enumerate(rows, start=1):
+        results.append(
+            {
+                "rank": index,
+                "league_path": row[0],
+                "league": row[1],
+                "rating": float(row[2]) if row[2] is not None else None,
+            }
+        )
+    return results
+
+
+def load_league_home_away_ratings(league_url: str, database_url: str | None = None) -> dict | None:
+    path = _path_from_url(league_url)
+    with db_cursor(database_url, use_direct=False) as (_, cur):
+        cur.execute(
+            """
+            SELECT id, league_path
+            FROM leagues
+            WHERE league_path = %s
+            """,
+            (path,),
+        )
+        league_row = cur.fetchone()
+        if league_row is None:
+            return None
+
+        league_id = league_row[0]
+        payload = {"league_url": league_row[1]}
+        for mode in ("home", "away", "general"):
+            cur.execute(
+                """
+                SELECT t.name, t.team_path, rs.ranking, rs.rating
+                FROM rating_snapshots rs
+                JOIN teams t ON t.id = rs.team_id
+                WHERE rs.scope = 'team'
+                  AND rs.league_id = %s
+                  AND rs.mode = %s
+                ORDER BY rs.fetched_at DESC, rs.ranking ASC
+                """,
+                (league_id, mode),
+            )
+            rows = cur.fetchall()
+            deduped_rows: list[dict] = []
+            seen_team_ids: set[tuple[str, str | None]] = set()
+            for row in rows:
+                team_key = (row[0], row[1])
+                if team_key in seen_team_ids:
+                    continue
+                seen_team_ids.add(team_key)
+                deduped_rows.append(
+                    {
+                        "team": row[0],
+                        "team_path": row[1],
+                        "rank": row[2],
+                        "rating": float(row[3]),
+                        "mode": mode,
+                    }
+                )
+            payload[mode] = deduped_rows
+
+    if not payload.get("home") or not payload.get("away"):
+        return None
+    return payload
 
 
 def _upsert_country(cur, name: str, country_path: str | None, latest_rating: float | None) -> int:

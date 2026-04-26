@@ -49,10 +49,29 @@ Import league ratings for one country:
 python3 app.py import-league-ratings --country-url /England/
 ```
 
+This now stores:
+
+- country-level league summary rows
+- team `general` snapshots
+- team `home` snapshots
+- team `away` snapshots
+
 Import deduped league history:
 
 ```bash
 python3 app.py import-league-history --league-url /England/UK1/
+```
+
+Import deduped history for every league in one country:
+
+```bash
+python3 app.py import-country-history --country-url /England/
+```
+
+Import deduped history for every ranked country and league:
+
+```bash
+python3 app.py import-all-history
 ```
 
 ## Run
@@ -116,6 +135,8 @@ Inside the dashboard you can:
 - use each row to choose home and away teams and instantly see `1`, `X`, `2`, `Home DNB`, and `Away DNB`
 - build and refresh a cached league-history dataset for the currently selected league
 
+For larger imports, prefer the Postgres CLI commands over the dashboard button so you do not need to build history one league at a time.
+
 Crawl all leagues in one country:
 
 ```bash
@@ -169,9 +190,16 @@ The dashboard comparison uses:
 - the selected home team's `home` rating
 - the selected away team's `away` rating
 - an Elo-style logistic curve for the home/away win split
-- a draw probability that is highest when teams are close in rating and lower when the gap grows
+- a historical calibration layer from Postgres league matches when available
+- a draw probability that is adjusted by nearby historical matches with similar rating gaps
 
-These are fair, marginless model odds based on rating only. They are not bookmaker odds.
+So the current fair model is:
+
+- live current ratings for the selected teams
+- historical league matches from Postgres for the same competition
+- expected draw tendency and goal expectation around the same rating-gap neighborhood
+
+If no historical Postgres data is available for that league yet, the app falls back to the rating-only model.
 
 When you enter a margin in the dashboard, the displayed odds are adjusted with the Shin method.
 
