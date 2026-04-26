@@ -34,10 +34,126 @@ class DashboardBindError(RuntimeError):
     """Raised when the dashboard cannot bind its requested address."""
 
 
-def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
+def _build_dashboard_services():
     countries_cache: list[dict] | None = None
     leagues_cache: dict[str, list[dict]] = {}
     ratings_cache: dict[str, dict] = {}
+
+    def get_countries() -> list[dict]:
+        nonlocal countries_cache
+        if countries_cache is None:
+            try:
+                countries_cache = load_country_rankings_from_db()
+            except Exception:
+                countries_cache = None
+            if not countries_cache:
+                countries_cache = fetch_rankings()
+        return countries_cache
+
+    def get_leagues(country_url: str) -> list[dict]:
+        if country_url not in leagues_cache:
+            try:
+                leagues_cache[country_url] = load_country_leagues_from_db(country_url)
+            except Exception:
+                leagues_cache[country_url] = []
+            if not leagues_cache[country_url]:
+                leagues_cache[country_url] = fetch_country_leagues(country_url)
+        return leagues_cache[country_url]
+
+    def get_ratings(league_url: str) -> dict:
+        if league_url not in ratings_cache:
+            try:
+                ratings_cache[league_url] = load_league_home_away_ratings_from_db(league_url)
+            except Exception:
+                ratings_cache[league_url] = None
+            if not ratings_cache[league_url]:
+                ratings_cache[league_url] = fetch_league_home_away_ratings(league_url)
+        return ratings_cache[league_url]
+
+    def get_league_stats(league_url: str) -> dict | None:
+        try:
+            league_stats = load_league_summary_stats(league_url)
+        except Exception:
+            league_stats = None
+        if league_stats is None:
+            cached = load_cached_league_history(league_url)
+            if cached is not None:
+                league_stats = summarize_league_stats(
+                    filter_matches_for_league(cached.get("matches", []), league_url)
+                )
+        return league_stats
+
+    def get_comparison(
+        league_url: str,
+        home_team: str,
+        away_team: str,
+        margin_percent: float,
+    ) -> dict:
+        ratings = get_ratings(league_url)
+
+        historical_matches: list[dict] = []
+        history_source = "none"
+        try:
+            historical_matches = load_league_history_matches(league_url)
+            if historical_matches:
+                history_source = "postgres"
+        except Exception:
+            historical_matches = []
+
+        if not historical_matches:
+            cached = load_cached_league_history(league_url)
+            if cached is not None:
+                historical_matches = filter_matches_for_league(
+                    cached.get("matches", []),
+                    league_url,
+                )
+                if historical_matches:
+                    history_source = "cache"
+
+        comparison = compare_teams_from_ratings(
+            ratings["home"],
+            ratings["away"],
+            home_team=home_team,
+            away_team=away_team,
+            margin_percent=margin_percent,
+            historical_matches=historical_matches,
+        )
+        comparison["history_source"] = history_source
+        return comparison
+
+    def get_history_status(league_url: str) -> dict:
+        cached = load_cached_league_history(league_url)
+        if cached is None:
+            return {"cached": False, "league_url": league_url}
+        return {
+            "cached": True,
+            "league_url": cached.get("league_url", league_url),
+            "team_count": cached.get("team_count", 0),
+            "raw_match_count": cached.get("raw_match_count", 0),
+            "deduped_match_count": cached.get("deduped_match_count", 0),
+            "cache_path": cached.get("cache_path", ""),
+        }
+
+    def build_history_cache(league_url: str, refresh: bool) -> dict:
+        return build_and_cache_league_history(league_url, force_refresh=refresh)
+
+    def import_history_to_db(league_url: str) -> dict:
+        return import_league_history_to_db(league_url)
+
+    return {
+        "get_countries": get_countries,
+        "get_leagues": get_leagues,
+        "get_ratings": get_ratings,
+        "get_league_stats": get_league_stats,
+        "get_comparison": get_comparison,
+        "get_history_status": get_history_status,
+        "build_history_cache": build_history_cache,
+        "import_history_to_db": import_history_to_db,
+    }
+
+
+def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
+    services = _build_dashboard_services()
 
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -52,15 +168,7 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                 return
 
             if parsed.path == "/api/countries":
-                nonlocal countries_cache
-                if countries_cache is None:
-                    try:
-                        countries_cache = load_country_rankings_from_db()
-                    except Exception:
-                        countries_cache = None
-                    if not countries_cache:
-                        countries_cache = fetch_rankings()
-                self._send_json({"countries": countries_cache})
+                self._send_json({"countries": services["get_countries"]()})
                 return
 
             if parsed.path == "/api/leagues":
@@ -73,14 +181,7 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     )
                     return
 
-                if country_url not in leagues_cache:
-                    try:
-                        leagues_cache[country_url] = load_country_leagues_from_db(country_url)
-                    except Exception:
-                        leagues_cache[country_url] = []
-                    if not leagues_cache[country_url]:
-                        leagues_cache[country_url] = fetch_country_leagues(country_url)
-                self._send_json({"leagues": leagues_cache[country_url]})
+                self._send_json({"leagues": services["get_leagues"](country_url)})
                 return
 
             if parsed.path == "/api/league-ratings":
@@ -93,27 +194,8 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     )
                     return
 
-                if league_url not in ratings_cache:
-                    try:
-                        ratings_cache[league_url] = load_league_home_away_ratings_from_db(league_url)
-                    except Exception:
-                        ratings_cache[league_url] = None
-                    if not ratings_cache[league_url]:
-                        ratings_cache[league_url] = fetch_league_home_away_ratings(league_url)
-                league_stats = None
-                try:
-                    league_stats = load_league_summary_stats(league_url)
-                except Exception:
-                    league_stats = None
-                if league_stats is None:
-                    cached = load_cached_league_history(league_url)
-                    if cached is not None:
-                        league_stats = summarize_league_stats(
-                            filter_matches_for_league(cached.get("matches", []), league_url)
-                        )
-
-                payload = dict(ratings_cache[league_url])
-                payload["league_stats"] = league_stats
+                payload = dict(services["get_ratings"](league_url))
+                payload["league_stats"] = services["get_league_stats"](league_url)
                 self._send_json(payload)
                 return
 
@@ -130,47 +212,17 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     )
                     return
 
-                if league_url not in ratings_cache:
-                    try:
-                        ratings_cache[league_url] = load_league_home_away_ratings_from_db(league_url)
-                    except Exception:
-                        ratings_cache[league_url] = None
-                    if not ratings_cache[league_url]:
-                        ratings_cache[league_url] = fetch_league_home_away_ratings(league_url)
-
-                historical_matches: list[dict] = []
-                history_source = "none"
                 try:
-                    historical_matches = load_league_history_matches(league_url)
-                    if historical_matches:
-                        history_source = "postgres"
-                except Exception:
-                    historical_matches = []
-
-                if not historical_matches:
-                    cached = load_cached_league_history(league_url)
-                    if cached is not None:
-                        historical_matches = filter_matches_for_league(
-                            cached.get("matches", []),
-                            league_url,
-                        )
-                        if historical_matches:
-                            history_source = "cache"
-
-                try:
-                    comparison = compare_teams_from_ratings(
-                        ratings_cache[league_url]["home"],
-                        ratings_cache[league_url]["away"],
+                    comparison = services["get_comparison"](
+                        league_url=league_url,
                         home_team=home_team,
                         away_team=away_team,
                         margin_percent=margin_percent,
-                        historical_matches=historical_matches,
                     )
                 except ValueError as exc:
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                     return
 
-                comparison["history_source"] = history_source
                 self._send_json(comparison)
                 return
 
@@ -184,21 +236,7 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     )
                     return
 
-                cached = load_cached_league_history(league_url)
-                if cached is None:
-                    self._send_json({"cached": False, "league_url": league_url})
-                    return
-
-                self._send_json(
-                    {
-                        "cached": True,
-                        "league_url": cached.get("league_url", league_url),
-                        "team_count": cached.get("team_count", 0),
-                        "raw_match_count": cached.get("raw_match_count", 0),
-                        "deduped_match_count": cached.get("deduped_match_count", 0),
-                        "cache_path": cached.get("cache_path", ""),
-                    }
-                )
+                self._send_json(services["get_history_status"](league_url))
                 return
 
             if parsed.path == "/api/league-history/build":
@@ -212,7 +250,7 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     )
                     return
 
-                payload = build_and_cache_league_history(league_url, force_refresh=refresh)
+                payload = services["build_history_cache"](league_url, refresh)
                 self._send_json(payload)
                 return
 
@@ -227,7 +265,7 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                     return
 
                 try:
-                    payload = import_league_history_to_db(league_url)
+                    payload = services["import_history_to_db"](league_url)
                 except Exception as exc:
                     self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
@@ -268,9 +306,83 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
     return DashboardHandler
 
 
+def create_dashboard_app():
+    from fastapi import FastAPI, HTTPException, Query
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+
+    services = _build_dashboard_services()
+    app = FastAPI(title="Soccer Ratings Dashboard")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> str:
+        return INDEX_HTML
+
+    @app.get("/health", response_class=PlainTextResponse)
+    def health() -> str:
+        return "ok"
+
+    @app.get("/favicon.svg")
+    def favicon() -> Response:
+        return Response(content=FAVICON_SVG, media_type="image/svg+xml")
+
+    @app.get("/api/countries")
+    def countries() -> JSONResponse:
+        return JSONResponse({"countries": services["get_countries"]()})
+
+    @app.get("/api/leagues")
+    def leagues(country_url: str = Query(...)) -> JSONResponse:
+        return JSONResponse({"leagues": services["get_leagues"](country_url)})
+
+    @app.get("/api/league-ratings")
+    def league_ratings(league_url: str = Query(...)) -> JSONResponse:
+        payload = dict(services["get_ratings"](league_url))
+        payload["league_stats"] = services["get_league_stats"](league_url)
+        return JSONResponse(payload)
+
+    @app.get("/api/compare")
+    def compare(
+        league_url: str = Query(...),
+        home_team: str = Query(...),
+        away_team: str = Query(...),
+        margin: float = Query(0.0),
+    ) -> JSONResponse:
+        try:
+            payload = services["get_comparison"](
+                league_url=league_url,
+                home_team=home_team,
+                away_team=away_team,
+                margin_percent=margin,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
+    @app.get("/api/league-history/status")
+    def league_history_status(league_url: str = Query(...)) -> JSONResponse:
+        return JSONResponse(services["get_history_status"](league_url))
+
+    @app.get("/api/league-history/build")
+    def league_history_build(
+        league_url: str = Query(...),
+        refresh: int = Query(0),
+    ) -> JSONResponse:
+        return JSONResponse(services["build_history_cache"](league_url, bool(refresh)))
+
+    @app.get("/api/league-history/import")
+    def league_history_import(league_url: str = Query(...)) -> JSONResponse:
+        try:
+            payload = services["import_history_to_db"](league_url)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
+    return app
+
+
 def run_dashboard(host: str = "127.0.0.1", port: int = 8001) -> None:
+    probe_server = None
     try:
-        server = ThreadingHTTPServer((host, port), create_dashboard_handler())
+        probe_server = ThreadingHTTPServer((host, port), create_dashboard_handler())
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             next_port = port + 1
@@ -286,13 +398,23 @@ def run_dashboard(host: str = "127.0.0.1", port: int = 8001) -> None:
                 )
             ) from exc
         raise
+    finally:
+        if probe_server is not None:
+            probe_server.server_close()
+
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise RuntimeError(
+            "uvicorn is required to run the deployment-ready dashboard. Install dependencies from requirements.txt."
+        ) from exc
+
+    app = create_dashboard_app()
     print(f"Dashboard running at http://{host}:{port}")
     try:
-        server.serve_forever()
+        uvicorn.run(app, host=host, port=port, log_level="info")
     except KeyboardInterrupt:
         pass
-    finally:
-        server.server_close()
 
 
 def _require_query_param(params: dict[str, list[str]], name: str) -> str | None:

@@ -74,6 +74,42 @@ Import deduped history for every ranked country and league:
 python3 app.py import-all-history
 ```
 
+## Deployment
+
+Recommended production setup:
+
+- Render for the web app
+- Supabase for Postgres
+- scheduled imports via Render Cron or GitHub Actions later
+
+This repo now includes:
+
+- `soccer_ratings/webapp.py` as the ASGI entrypoint
+- `render.yaml` for Render deployment
+- `/health` healthcheck endpoint
+
+Render start command:
+
+```bash
+uvicorn soccer_ratings.webapp:app --host 0.0.0.0 --port $PORT
+```
+
+Required environment variables on Render:
+
+```bash
+DATABASE_URL=your_supabase_pooler_url
+DIRECT_DATABASE_URL=your_supabase_direct_or_pooler_url
+```
+
+After the first deploy, initialize and import data from a Render shell or another trusted environment:
+
+```bash
+python3 app.py init-db
+python3 app.py import-country-rankings
+python3 app.py import-league-ratings --country-url /England/
+python3 app.py import-country-history --country-url /England/
+```
+
 ## Run
 
 Fetch all countries:
