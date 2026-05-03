@@ -18,6 +18,7 @@ from .client import (
 )
 from .db import load_league_history_matches
 from .db import (
+    import_country_history as import_country_history_to_db,
     import_league_history as import_league_history_to_db,
     load_country_leagues as load_country_leagues_from_db,
 )
@@ -132,6 +133,9 @@ def _build_dashboard_services():
     def import_history_to_db(league_url: str) -> dict:
         return import_league_history_to_db(league_url)
 
+    def import_country_to_db(country_url: str) -> dict:
+        return import_country_history_to_db(country_url)
+
     return {
         "get_countries": get_countries,
         "get_leagues": get_leagues,
@@ -141,6 +145,7 @@ def _build_dashboard_services():
         "get_history_status": get_history_status,
         "build_history_cache": build_history_cache,
         "import_history_to_db": import_history_to_db,
+        "import_country_to_db": import_country_to_db,
     }
 
 
@@ -265,6 +270,25 @@ def create_dashboard_handler() -> type[BaseHTTPRequestHandler]:
                 self._send_json(payload)
                 return
 
+            if parsed.path == "/api/country-history/import":
+                params = parse_qs(parsed.query)
+                country_url = _require_query_param(params, "country_url")
+                if not country_url:
+                    self._send_json(
+                        {"error": "Missing required query parameter: country_url"},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+
+                try:
+                    payload = services["import_country_to_db"](country_url)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+
+                self._send_json(payload)
+                return
+
             self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
         def log_message(self, format: str, *args) -> None:  # noqa: A003
@@ -364,6 +388,14 @@ def create_dashboard_app():
     def league_history_import(league_url: str = Query(...)) -> JSONResponse:
         try:
             payload = services["import_history_to_db"](league_url)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
+    @app.get("/api/country-history/import")
+    def country_history_import(country_url: str = Query(...)) -> JSONResponse:
+        try:
+            payload = services["import_country_to_db"](country_url)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return JSONResponse(payload)
@@ -1324,6 +1356,7 @@ INDEX_HTML = """<!doctype html>
         <select id="country" disabled>
           <option>Select a continent first</option>
         </select>
+        <button id="import-country" disabled style="margin-top:4px;">Import Country to DB</button>
       </div>
       <div class="control">
         <label for="league">League</label>
@@ -1530,6 +1563,7 @@ INDEX_HTML = """<!doctype html>
     const leagueSelect = document.getElementById("league");
     const buildHistoryButton = document.getElementById("build-history");
     const importHistoryButton = document.getElementById("import-history");
+    const importCountryButton = document.getElementById("import-country");
     const statusEl = document.getElementById("status");
     const homeTable = document.getElementById("home-table");
     const awayTable = document.getElementById("away-table");
@@ -2114,6 +2148,26 @@ INDEX_HTML = """<!doctype html>
       setStatus(`Imported ${data.matches_imported} matches to Postgres for the selected league.`);
     }
 
+    async function importCountryToDb() {
+      if (!state.selectedCountry) {
+        return;
+      }
+
+      importCountryButton.disabled = true;
+      importCountryButton.textContent = "Importing...";
+      setStatus("Importing all leagues for this country into Postgres — this may take a while...");
+      const data = await fetchJson(
+        `/api/country-history/import?country_url=${encodeURIComponent(state.selectedCountry)}`
+      );
+      importCountryButton.textContent = "Import Country to DB";
+      importCountryButton.disabled = false;
+      const leagues = data.leagues_processed ?? 0;
+      const matches = data.matches_imported ?? 0;
+      const failures = data.failure_count ?? 0;
+      const failNote = failures ? ` (${failures} league(s) failed)` : "";
+      setStatus(`Country import done: ${leagues} leagues, ${matches} matches imported${failNote}.`);
+    }
+
     async function compareTeams() {
       if (!state.selectedLeague || !homeTeamSelect.value || !awayTeamSelect.value || state.loadingComparison) {
         return;
@@ -2184,6 +2238,7 @@ INDEX_HTML = """<!doctype html>
       leagueSelect.disabled = true;
       buildHistoryButton.disabled = true;
       importHistoryButton.disabled = true;
+      importCountryButton.disabled = true;
       buildHistoryButton.textContent = "Build Local Cache";
       importHistoryButton.textContent = "Import To DB";
       resetComparison();
@@ -2214,6 +2269,7 @@ INDEX_HTML = """<!doctype html>
         leagueSelect.disabled = true;
         buildHistoryButton.disabled = true;
         importHistoryButton.disabled = true;
+        importCountryButton.disabled = true;
         buildHistoryButton.textContent = "Build Local Cache";
         importHistoryButton.textContent = "Import To DB";
         resetMultiBuilder();
@@ -2222,6 +2278,7 @@ INDEX_HTML = """<!doctype html>
         setStatus("Choose a country to load its leagues.");
         return;
       }
+      importCountryButton.disabled = false;
 
       try {
         await loadLeagues(state.selectedCountry);
@@ -2343,6 +2400,14 @@ INDEX_HTML = """<!doctype html>
       importLeagueHistoryToDb().catch((error) => {
         importHistoryButton.disabled = false;
         importHistoryButton.textContent = "Import To DB";
+        setStatus(error.message);
+      });
+    });
+
+    importCountryButton.addEventListener("click", () => {
+      importCountryToDb().catch((error) => {
+        importCountryButton.disabled = false;
+        importCountryButton.textContent = "Import Country to DB";
         setStatus(error.message);
       });
     });
